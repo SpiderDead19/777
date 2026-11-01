@@ -1,5 +1,6 @@
 from io import BytesIO
 from pathlib import Path
+import re
 
 import pandas as pd
 import streamlit as st
@@ -21,6 +22,26 @@ files = st.file_uploader("Счета / коммерческие предложе
 
 def parse_file(uploaded):
     return parse_invoice(uploaded) if Path(uploaded.name).suffix.lower() == ".pdf" else parse_excel_invoice(uploaded)
+
+
+def safe_filename(value):
+    name = re.sub(r'[<>:"/\\|?*]+', "_", str(value)).strip().strip(".")
+    return name[:120] or "Поставщик"
+
+
+def supplier_order_excel(supplier, group):
+    output = BytesIO()
+    order = group.copy()
+    total = pd.to_numeric(order["Сумма"], errors="coerce").fillna(0).sum()
+    summary = pd.DataFrame([{
+        "Поставщик": supplier,
+        "Количество позиций": len(order),
+        "Итого": total,
+    }])
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        order.to_excel(writer, sheet_name="Заказ", index=False)
+        summary.to_excel(writer, sheet_name="Итого", index=False)
+    return output.getvalue()
 
 
 def price_alerts(suppliers, summary):
@@ -90,6 +111,18 @@ if files:
             st.subheader("Заказы по поставщикам")
             st.dataframe(supplier_totals, use_container_width=True, hide_index=True)
 
+            st.subheader("Финальные Excel-файлы по поставщикам")
+            st.caption("Каждый поставщик получает отдельный Excel-файл с названием по наименованию поставщика.")
+            for supplier, group in edited_plan.groupby("Поставщик", sort=False):
+                file_name = f"{safe_filename(supplier)}.xlsx"
+                st.download_button(
+                    label=f"Скачать — {supplier}",
+                    data=supplier_order_excel(supplier, group),
+                    file_name=file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_supplier_{safe_filename(supplier)}",
+                )
+
         summary_before = history_summary()
         alerts = price_alerts(suppliers, summary_before)
         if not alerts.empty:
@@ -114,7 +147,7 @@ if files:
             for idx, (supplier, df) in enumerate(suppliers.items(), start=1):
                 safe = "".join(ch for ch in supplier if ch not in "[]:*?/\\")[:25]
                 df.to_excel(writer, sheet_name=f"Исх_{idx}_{safe}"[:31], index=False)
-        st.download_button("Скачать заявку и сравнение Excel", data=output.getvalue(), file_name="ai_procurement_order.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Скачать общий Excel-отчёт", data=output.getvalue(), file_name="ai_procurement_order.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Загрузите минимум одно предложение в PDF или Excel. Для сравнения рекомендуется 2 и более поставщика.")
 
