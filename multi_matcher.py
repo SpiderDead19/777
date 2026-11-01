@@ -35,7 +35,7 @@ def compare_suppliers(suppliers, threshold=72):
                 price = float(row.get("price"))
             except (TypeError, ValueError):
                 continue
-            quantity = row.get("quantity", None)
+            quantity = pd.to_numeric(row.get("quantity", None), errors="coerce")
             idx, score = _find_group(groups, article, name, threshold)
             offer = {"supplier": supplier, "article": article, "name": name, "price": price, "quantity": quantity, "score": score}
             if idx is None:
@@ -48,14 +48,17 @@ def compare_suppliers(suppliers, threshold=72):
         offers = group["offers"]
         best = min(offers, key=lambda x: x["price"])
         prices = [x["price"] for x in offers]
+        quantities = [x["quantity"] for x in offers if not pd.isna(x["quantity"]) and x["quantity"] > 0]
+        quantity = quantities[0] if quantities else 1.0
         row = {
             "Артикул": group["article"],
             "Наименование": group["name"],
+            "Количество": float(quantity),
             "Лучшая цена": best["price"],
             "Лучший поставщик": best["supplier"],
             "Предложений": len(offers),
             "Макс. цена": max(prices),
-            "Экономия с макс. цены": max(prices) - best["price"],
+            "Экономия с макс. цены": (max(prices) - best["price"]) * float(quantity),
             "Разброс, %": ((max(prices) - min(prices)) / min(prices) * 100) if min(prices) else None,
         }
         for offer in offers:
