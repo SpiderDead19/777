@@ -8,10 +8,11 @@ from excel_parser import parse_excel_invoice
 from history_db import history_summary, load_history, save_suppliers
 from multi_matcher import compare_suppliers
 from pdf_parser import parse_invoice
+from purchase_plan import build_purchase_plan
 
 st.set_page_config(page_title="ИИ-Снабженец v2", page_icon="📊", layout="wide")
 st.title("ИИ-Снабженец v2")
-st.caption("PDF/Excel → сравнение поставщиков → лучшие цены → история закупок и контроль роста цен.")
+st.caption("PDF/Excel → сравнение поставщиков → лучшие цены → заявка на закупку → история цен.")
 
 threshold = st.slider("Минимальная уверенность сопоставления по названию, %", 50, 100, 72)
 alert_pct = st.number_input("Предупреждать о росте цены выше, %", min_value=0.0, value=10.0, step=1.0)
@@ -70,12 +71,24 @@ if files:
         comparison = compare_suppliers(suppliers, threshold=threshold)
         st.subheader("Оптимальный выбор по поставщикам")
         st.dataframe(comparison, use_container_width=True, hide_index=True)
+
+        plan, supplier_totals = build_purchase_plan(comparison)
         if not comparison.empty:
             total_saving = comparison["Экономия с макс. цены"].fillna(0).sum()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Сопоставлено товаров", len(comparison))
+            total_order = plan["Сумма"].sum() if not plan.empty else 0
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Товаров", len(comparison))
             c2.metric("Поставщиков", len(suppliers))
-            c3.metric("Потенциальная экономия", f"{total_saving:,.2f}")
+            c3.metric("Сумма закупки", f"{total_order:,.2f}")
+            c4.metric("Потенциальная экономия", f"{total_saving:,.2f}")
+
+        if not plan.empty:
+            st.subheader("Заявка на закупку")
+            edited_plan = st.data_editor(plan, use_container_width=True, hide_index=True, num_rows="fixed", disabled=["Поставщик", "Артикул", "Наименование", "Цена", "Сумма"], column_config={"Количество": st.column_config.NumberColumn(min_value=0.0, step=1.0)})
+            edited_plan["Сумма"] = pd.to_numeric(edited_plan["Количество"], errors="coerce").fillna(0) * pd.to_numeric(edited_plan["Цена"], errors="coerce").fillna(0)
+            supplier_totals = edited_plan.groupby("Поставщик", as_index=False).agg(Позиций=("Наименование", "count"), "Общая сумма"=("Сумма", "sum"))
+            st.subheader("Заказы по поставщикам")
+            st.dataframe(supplier_totals, use_container_width=True, hide_index=True)
 
         summary_before = history_summary()
         alerts = price_alerts(suppliers, summary_before)
@@ -90,12 +103,18 @@ if files:
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             comparison.to_excel(writer, sheet_name="Лучшие цены", index=False)
+            if not plan.empty:
+                edited_plan.to_excel(writer, sheet_name="Заявка на закупку", index=False)
+                supplier_totals.to_excel(writer, sheet_name="Итого по поставщикам", index=False)
+                for supplier, group in edited_plan.groupby("Поставщик"):
+                    safe = "".join(ch for ch in str(supplier) if ch not in "[]:*?/\\")[:24]
+                    group.to_excel(writer, sheet_name=f"Заказ_{safe}"[:31], index=False)
             if not alerts.empty:
                 alerts.to_excel(writer, sheet_name="Предупреждения", index=False)
             for idx, (supplier, df) in enumerate(suppliers.items(), start=1):
                 safe = "".join(ch for ch in supplier if ch not in "[]:*?/\\")[:25]
-                df.to_excel(writer, sheet_name=f"{idx}_{safe}"[:31], index=False)
-        st.download_button("Скачать итоговый Excel", data=output.getvalue(), file_name="ai_procurement_comparison.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                df.to_excel(writer, sheet_name=f"Исх_{idx}_{safe}"[:31], index=False)
+        st.download_button("Скачать заявку и сравнение Excel", data=output.getvalue(), file_name="ai_procurement_order.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Загрузите минимум одно предложение в PDF или Excel. Для сравнения рекомендуется 2 и более поставщика.")
 
