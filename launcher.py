@@ -24,15 +24,25 @@ def wait_and_open(port: int) -> None:
             time.sleep(0.25)
 
 
+def free_port() -> int:
+    """Choose an available localhost port so a running app does not block launch."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def main() -> None:
-    port = 8501
+    os.environ.setdefault("SNAB_LOCAL_MODE", "1")
+    port = free_port()
     threading.Thread(target=wait_and_open, args=(port,), daemon=True).start()
     sys.argv = [
         "streamlit",
         "run",
-        resource_path("app.py"),
+        resource_path("online_app.py"),
         "--server.headless=true",
+        "--server.address=127.0.0.1",
         f"--server.port={port}",
+        "--server.fileWatcherType=none",
         "--browser.gatherUsageStats=false",
     ]
     stcli.main()

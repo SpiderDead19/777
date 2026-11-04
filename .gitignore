@@ -6,3 +6,8 @@ venv/
 .DS_Store
 *.xlsx
 *.xls
+# Private supplier quotes and application secrets
+.streamlit/secrets.toml
+*.db
+data/
+*.pdf
