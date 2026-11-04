@@ -50,15 +50,26 @@ def guard():
         return
     st.title("⚙️ ИИ-Снабженец")
     st.caption("Закрытый онлайн-кабинет отдела снабжения")
-    with st.form("sign_in", clear_on_submit=True):
-        password = st.text_input("Пароль доступа", type="password")
+    st.markdown("**Введите пароль доступа к приложению:**")
+    show_password = st.checkbox("Показать вводимые символы", key="snab_show_password")
+    with st.form("sign_in", clear_on_submit=False):
+        password = st.text_input(
+            "Пароль",
+            type="default" if show_password else "password",
+            placeholder="Нажмите сюда и введите пароль",
+            label_visibility="visible",
+            key="snab_login_password",
+        )
         ok = st.form_submit_button("Войти", type="primary", use_container_width=True)
     if ok:
-        if hmac.compare_digest(password.encode(), configured.encode()):
+        if not password:
+            st.warning("Сначала нажмите на поле и введите пароль.")
+        elif hmac.compare_digest(password.encode(), configured.encode()):
             st.session_state["snab_authenticated"] = True
             st.rerun()
         else:
-            st.error("Неверный пароль.")
+            st.error("Неверный пароль. Используйте тот, который задан в настройках Secrets.")
+    st.caption("Если пароль неизвестен: откройте панель управления Streamlit Cloud → App settings → Secrets. Не публикуйте пароль в чате.")
     st.stop()
 
 guard()
