@@ -6,9 +6,9 @@ Brand quality scores are procurement *heuristics*, not proof of authenticity.
 from __future__ import annotations
 
 import re
+import zipfile
 from io import BytesIO
 from pathlib import Path
-from collections import Counter
 from typing import Any
 
 import pandas as pd
@@ -25,6 +25,18 @@ CATEGORIES = {
     "Аналог без подтверждённого бренда": 65,
     "Бюджетный аналог": 60,
     "Качество не указано": 45,
+}
+SELECTION_MODES = {
+    "best_value": "Цена и качество",
+    "lowest_price": "Минимальная цена",
+    "original_only": "Только оригинал",
+}
+RISK_QUALITY = {
+    "Качество не указано",
+    "Аналог без подтверждённого бренда",
+    "Средний аналог",
+    "Бюджетный аналог",
+    "Восстановленный оригинал",
 }
 PREMIUM = {"skf", "fag", "ina", "timken", "bosch", "dayco", "euroricambi"}
 GOOD = {"dt spare parts", "vaden", "auger", "sampa", "ebs"}
@@ -210,12 +222,139 @@ def _price_rub(row: dict, eur_rate: float) -> float | None:
     price = float(row["price"])
     return price * eur_rate if row["currency"] == "EUR" else price
 
+def _risk_messages(row: dict | pd.Series, supplier: str) -> list[str]:
+    risks = [
+        item.strip()
+        for item in clean(row.get("Проверка сопоставления")).split(";")
+        if item.strip()
+    ]
+    if not as_number(row.get("Кол-во")):
+        risks.append("Не указано количество")
+    quality = clean(row.get(f"{supplier} · качество"))
+    if quality in RISK_QUALITY:
+        risks.append("Проверить качество/производителя")
+    if clean(row.get(f"{supplier} · валюта")) == "EUR":
+        risks.append("Проверить курс EUR и условия НДС/доставки")
+    if not clean(row.get(f"{supplier} · срок")):
+        risks.append("Срок поставки не указан")
+    return list(dict.fromkeys(risks))
+
+
+def _selected_values(row: dict | pd.Series, supplier: str, reason: str) -> dict[str, Any]:
+    price_rub = as_number(row.get(f"{supplier} · цена ₽"))
+    quantity = as_number(row.get("Кол-во"))
+    maximum = as_number(row.get("Макс. цена ₽"))
+    total = round(price_rub * quantity, 2) if price_rub is not None and quantity else None
+    saving = round((maximum - price_rub) * quantity, 2) if maximum is not None and price_rub is not None and quantity else None
+    return {
+        "Победитель": supplier,
+        "Выбранный класс": clean(row.get(f"{supplier} · качество")),
+        "Лучшая цена ₽": round(price_rub, 2) if price_rub is not None else None,
+        "Сумма ₽": total,
+        "Экономия ₽": saving,
+        "Проверки": "; ".join(_risk_messages(row, supplier)),
+        "Причина": reason,
+    }
+
+
+def _no_selection_values(reason: str, checks: str) -> dict[str, Any]:
+    return {
+        "Победитель": "Нет цены",
+        "Выбранный класс": "",
+        "Лучшая цена ₽": None,
+        "Сумма ₽": None,
+        "Экономия ₽": None,
+        "Проверки": checks,
+        "Причина": reason,
+    }
+
+
+def _suppliers_from_comparison(comparison: pd.DataFrame) -> list[str]:
+    suffix = " · цена ₽"
+    return [column[:-len(suffix)] for column in comparison.columns if column.endswith(suffix)]
+
+
+def build_allocations(comparison: pd.DataFrame, suppliers: list[str] | None = None) -> dict[str, pd.DataFrame]:
+    """Create supplier-specific orders from the currently selected winners."""
+    suppliers = suppliers or _suppliers_from_comparison(comparison)
+    allocations: dict[str, list[dict[str, Any]]] = {supplier: [] for supplier in suppliers}
+    for _, row in comparison.iterrows():
+        supplier = clean(row.get("Победитель"))
+        if supplier not in allocations or as_number(row.get(f"{supplier} · цена ₽")) is None:
+            continue
+        quantity = as_number(row.get("Кол-во"))
+        quote_price = as_number(row.get(f"{supplier} · цена КП"))
+        allocations[supplier].append({
+            "№": row.get("№"),
+            "Артикул": clean(row.get("Артикул")),
+            "Наименование": clean(row.get("Наименование")),
+            "Кол-во": quantity,
+            "Ед.": clean(row.get(f"{supplier} · ед.")) or "шт",
+            "Требование к качеству": clean(row.get(f"{supplier} · качество")),
+            "Указанный бренд": clean(row.get(f"{supplier} · бренд")),
+            "Цена за ед.": quote_price,
+            "Валюта": clean(row.get(f"{supplier} · валюта")) or "RUB",
+            "Сумма": round(quote_price * quantity, 2) if quote_price is not None and quantity else None,
+            "Срок": clean(row.get(f"{supplier} · срок")),
+            "Примечание": "Просим подтвердить цену, качество, наличие, срок, гарантию и совместимость",
+        })
+    return {supplier: pd.DataFrame(rows) for supplier, rows in allocations.items()}
+
+
+def apply_supplier_choices(
+    comparison: pd.DataFrame,
+    choices: dict[int, str],
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
+    """Apply user winner overrides and rebuild totals/orders.
+
+    A supplier without a valid price for the row is rejected and the automatic
+    winner is retained. This keeps the editable plan from creating fictitious orders.
+    """
+    result = comparison.copy()
+    suppliers = _suppliers_from_comparison(result)
+    warnings: list[str] = []
+    for index, row in result.iterrows():
+        number = int(row.get("№"))
+        automatic = clean(row.get("Автовыбор")) or clean(row.get("Победитель"))
+        desired = clean(choices.get(number, row.get("Победитель")))
+        if desired == "Нет цены":
+            if automatic == "Нет цены":
+                continue
+            values = _no_selection_values(
+                "Исключено из плана вручную",
+                clean(row.get("Проверка сопоставления")) or "Позиция исключена из плана",
+            )
+            for column, value in values.items():
+                result.at[index, column] = value
+            continue
+        if desired not in suppliers or as_number(row.get(f"{desired} · цена ₽")) is None:
+            warnings.append(
+                f"Позиция {number}: у поставщика «{desired or 'не указан'}» нет действующей цены; сохранён автовыбор."
+            )
+            desired = automatic
+        if desired not in suppliers or as_number(row.get(f"{desired} · цена ₽")) is None:
+            values = _no_selection_values("Нет действующего предложения", "Нет действующей цены")
+        else:
+            reason = (
+                f"Ручной выбор пользователя; {clean(row.get(f'{desired} · качество'))}"
+                if desired != automatic
+                else clean(row.get("Причина"))
+            )
+            values = _selected_values(row, desired, reason)
+        for column, value in values.items():
+            result.at[index, column] = value
+    return result, build_allocations(result, suppliers), warnings
+
+
 def compare_offers(offers: list[tuple[str, pd.DataFrame]], eur_rate: float, threshold: int = 85,
-                   quality_weight: float = 0.60) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+                   quality_weight: float = 0.60,
+                   selection_mode: str = "best_value") -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     """Build a union of supplier items with one-to-one links per supplier.
 
     Exact article match is preferred. Fuzzy name matches are labeled for manual review.
     """
+    if selection_mode not in SELECTION_MODES:
+        raise ValueError(f"Неизвестный режим выбора: {selection_mode}")
     if len({s for s, _ in offers}) != len(offers):
         raise ValueError("Названия поставщиков должны быть уникальными.")
     groups: list[dict] = []
@@ -257,7 +396,6 @@ def compare_offers(offers: list[tuple[str, pd.DataFrame]], eur_rate: float, thre
                     match["match_warnings"].append(f"{supplier}: количество отличается")
 
     combined = []
-    allocations: dict[str, list[dict]] = {s: [] for s, _ in offers}
     for k, group in enumerate(groups, 1):
         row = {
             "№": k, "Артикул": group["article"], "Наименование": group["name"],
@@ -268,56 +406,80 @@ def compare_offers(offers: list[tuple[str, pd.DataFrame]], eur_rate: float, thre
             offer = group["items"].get(supplier)
             price = _price_rub(offer, eur_rate) if offer else None
             quality = clean(offer.get("quality")) if offer else ""
+            row[f"{supplier} · цена КП"] = as_number(offer.get("price")) if offer else None
+            row[f"{supplier} · валюта"] = clean(offer.get("currency")) if offer else ""
             row[f"{supplier} · цена ₽"] = round(price, 2) if price is not None else None
             row[f"{supplier} · качество"] = quality
             row[f"{supplier} · бренд"] = clean(offer.get("brand")) if offer else ""
             row[f"{supplier} · срок"] = clean(offer.get("lead")) if offer else ""
+            row[f"{supplier} · ед."] = clean(offer.get("unit")) if offer else ""
             if price is not None:
-                candidates.append((supplier, price, quality, offer))
+                candidates.append({
+                    "supplier": supplier,
+                    "price": price,
+                    "quality": quality,
+                    "offer": offer,
+                })
         if candidates:
-            cheapest = min(p for _, p, _, _ in candidates)
-            ranked = []
-            for supplier, price, quality, offer in candidates:
-                score = quality_weight * CATEGORIES.get(quality, 45) + (1 - quality_weight) * 100 * cheapest / price
-                ranked.append((score, CATEGORIES.get(quality, 45), -price, supplier, price, quality, offer))
-            best = max(ranked)
-            _, _, _, winner, best_price, best_quality, best_offer = best
-            quantity = group["qty"]
-            # Do not assume missing demand quantity is one; avoid misleading totals.
-            total = round(best_price * quantity, 2) if quantity else None
-            risk = list(group["match_warnings"])
-            if not quantity:
-                risk.append("Не указано количество")
-            if best_quality in {"Качество не указано", "Аналог без подтверждённого бренда", "Средний аналог", "Бюджетный аналог", "Восстановленный оригинал"}:
-                risk.append("Проверить качество/производителя")
-            if best_offer["currency"] == "EUR":
-                risk.append("Проверить курс EUR и условия НДС/доставки")
-            if not clean(best_offer.get("lead")):
-                risk.append("Срок поставки не указан")
-            row.update({
-                "Победитель": winner, "Выбранный класс": best_quality,
-                "Лучшая цена ₽": round(best_price, 2), "Сумма ₽": total,
-                "Проверки": "; ".join(dict.fromkeys(risk)),
-                "Причина": ("Минимальная цена" if best_price == cheapest else "Лучшее сочетание цены и качества")
-                            + f"; {best_quality}",
-            })
-            allocations[winner].append({
-                "№": k, "Артикул": group["article"], "Наименование": group["name"],
-                "Кол-во": quantity, "Ед.": best_offer.get("unit", "шт"),
-                "Требование к качеству": best_quality, "Указанный бренд": clean(best_offer.get("brand")),
-                "Цена за ед.": best_offer.get("price"), "Валюта": best_offer["currency"],
-                "Сумма": round(float(best_offer["price"]) * quantity, 2) if quantity else None,
-                "Срок": clean(best_offer.get("lead")), "Примечание": "Просим подтвердить цену, качество, наличие, срок, гарантию и совместимость",
-            })
+            eligible = candidates
+            if selection_mode == "original_only":
+                eligible = [candidate for candidate in candidates if candidate["quality"] == "Оригинал"]
+            price_pool = eligible or candidates
+            row["Мин. цена ₽"] = round(min(candidate["price"] for candidate in price_pool), 2)
+            row["Макс. цена ₽"] = round(max(candidate["price"] for candidate in price_pool), 2)
+            if eligible:
+                cheapest = min(candidate["price"] for candidate in eligible)
+                if selection_mode in {"lowest_price", "original_only"}:
+                    best = min(
+                        eligible,
+                        key=lambda candidate: (
+                            candidate["price"],
+                            -CATEGORIES.get(candidate["quality"], 45),
+                            candidate["supplier"],
+                        ),
+                    )
+                else:
+                    best = max(
+                        eligible,
+                        key=lambda candidate: (
+                            quality_weight * CATEGORIES.get(candidate["quality"], 45)
+                            + (1 - quality_weight) * 100 * cheapest / candidate["price"],
+                            CATEGORIES.get(candidate["quality"], 45),
+                            -candidate["price"],
+                            candidate["supplier"],
+                        ),
+                    )
+                winner = best["supplier"]
+                if selection_mode == "original_only":
+                    reason = "Минимальная цена среди оригиналов; Оригинал"
+                elif selection_mode == "lowest_price":
+                    reason = f"Минимальная цена; {best['quality']}"
+                else:
+                    reason = (
+                        "Минимальная цена" if best["price"] == cheapest
+                        else "Лучшее сочетание цены и качества"
+                    ) + f"; {best['quality']}"
+                row["Автовыбор"] = winner
+                row.update(_selected_values(row, winner, reason))
+            else:
+                row["Автовыбор"] = "Нет цены"
+                checks = list(group["match_warnings"])
+                checks.append("Нет предложения класса «Оригинал»")
+                row.update(_no_selection_values(
+                    "Нет предложения, соответствующего правилу «Только оригинал»",
+                    "; ".join(dict.fromkeys(checks)),
+                ))
         else:
-            row.update({
-                "Победитель": "Нет цены", "Выбранный класс": "",
-                "Лучшая цена ₽": None, "Сумма ₽": None,
-                "Проверки": "Нет действующей цены" + ("; укажите курс EUR" if eur_rate <= 0 else ""),
-                "Причина": "Нет предложения с положительной ценой",
-            })
+            row["Мин. цена ₽"] = None
+            row["Макс. цена ₽"] = None
+            row["Автовыбор"] = "Нет цены"
+            row.update(_no_selection_values(
+                "Нет предложения с положительной ценой",
+                "Нет действующей цены" + ("; укажите курс EUR" if eur_rate <= 0 else ""),
+            ))
         combined.append(row)
-    return pd.DataFrame(combined), {s: pd.DataFrame(rows) for s, rows in allocations.items()}
+    comparison = pd.DataFrame(combined)
+    return comparison, build_allocations(comparison, [supplier for supplier, _ in offers])
 
 def excel_safe(df: pd.DataFrame) -> pd.DataFrame:
     """Prevent Excel formula execution from untrusted supplier text."""
@@ -329,26 +491,38 @@ def excel_safe(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 def make_excel(comparison: pd.DataFrame, allocations: dict[str, pd.DataFrame],
-               quality_weight: float, eur_rate: float) -> bytes:
+               quality_weight: float, eur_rate: float,
+               selection_mode: str = "best_value") -> bytes:
     from openpyxl.styles import Font, PatternFill, Alignment
     out = BytesIO()
     summary = []
     for supplier, df in allocations.items():
-        rows = len(df)
-        total = pd.to_numeric(df.get("Сумма", pd.Series(dtype=float)), errors="coerce").sum()
-        summary.append({"Поставщик": supplier, "Позиций": rows, "Сумма в валюте КП": None,
-                        "Сумма выбранных позиций, ₽": round(sum(
-                            (float(r["Сумма"]) * eur_rate if r["Валюта"] == "EUR" else float(r["Сумма"]))
-                            for r in df.to_dict("records") if as_number(r.get("Сумма")) is not None
-                        ), 2)})
+        selected = comparison[comparison["Победитель"] == supplier]
+        summary.append({
+            "Поставщик": supplier,
+            "Позиций": len(df),
+            "Сумма выбранных позиций, ₽": round(
+                pd.to_numeric(selected.get("Сумма ₽", pd.Series(dtype=float)), errors="coerce").sum(), 2
+            ),
+        })
+    total_sum = round(pd.to_numeric(comparison.get("Сумма ₽", pd.Series(dtype=float)), errors="coerce").sum(), 2)
+    total_saving = round(pd.to_numeric(comparison.get("Экономия ₽", pd.Series(dtype=float)), errors="coerce").sum(), 2)
+    summary.append({"Поставщик": "ИТОГО", "Позиций": int(comparison["Победитель"].ne("Нет цены").sum()),
+                    "Сумма выбранных позиций, ₽": total_sum, "Экономия ₽": total_saving})
+    plan = comparison[
+        ["№", "Артикул", "Наименование", "Кол-во", "Победитель", "Выбранный класс",
+         "Лучшая цена ₽", "Сумма ₽", "Экономия ₽", "Проверки"]
+    ].copy()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         pd.DataFrame(summary).to_excel(writer, sheet_name="Итоги", index=False)
+        excel_safe(plan).to_excel(writer, sheet_name="План закупки", index=False)
         excel_safe(comparison).to_excel(writer, sheet_name="Сравнение", index=False)
         risk = comparison[comparison["Проверки"].fillna("").ne("")].copy()
         excel_safe(risk).to_excel(writer, sheet_name="Требует проверки", index=False)
         pd.DataFrame([
             {"Параметр": "Вес качества", "Значение": quality_weight},
             {"Параметр": "Вес цены", "Значение": 1-quality_weight},
+            {"Параметр": "Правило автовыбора", "Значение": SELECTION_MODES.get(selection_mode, selection_mode)},
             {"Параметр": "Курс EUR/RUB (указан пользователем)", "Значение": eur_rate},
             {"Параметр": "Источник классификации", "Значение": "Маркировка КП + ориентировочные брендовые категории"},
             {"Параметр": "Статус", "Значение": "Предварительный анализ; оригинальность и аналоги требуют проверки"},
@@ -393,4 +567,23 @@ def supplier_excel(df: pd.DataFrame, supplier: str) -> bytes:
             letter = col[0].column_letter
             maximum = max((len(str(cell.value or "")) for cell in col[:100]), default=12)
             sheet.column_dimensions[letter].width = min(50, max(12, maximum+3))
+    return out.getvalue()
+
+
+def supplier_zip(allocations: dict[str, pd.DataFrame]) -> bytes:
+    """Package all non-empty supplier orders into one ZIP archive."""
+    out = BytesIO()
+    used: set[str] = set()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for supplier, df in allocations.items():
+            if df.empty:
+                continue
+            base = re.sub(r"[^a-zA-Zа-яА-Я0-9_-]+", "_", supplier).strip("_")[:45] or "supplier"
+            filename = f"zayavka_{base}.xlsx"
+            counter = 2
+            while filename.lower() in used:
+                filename = f"zayavka_{base}_{counter}.xlsx"
+                counter += 1
+            used.add(filename.lower())
+            archive.writestr(filename, supplier_excel(df, supplier))
     return out.getvalue()

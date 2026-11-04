@@ -1,12 +1,13 @@
 """Regression checks for the online procurement comparison."""
 import unittest
+import zipfile
 from io import BytesIO
 
 import pandas as pd
 
 from online_core import (
-    CATEGORIES, article_from_name, compare_offers, make_excel, parse_offer,
-    supplier_excel,
+    apply_supplier_choices, article_from_name, compare_offers, make_excel,
+    parse_offer, supplier_excel, supplier_zip,
 )
 
 def excel_bytes(header, rows):
@@ -78,8 +79,53 @@ class ProcurementOnlineTests(unittest.TestCase):
         comparison, allocations = compare_offers(self.offers, eur_rate=90)
         file_bytes = make_excel(comparison, allocations, 0.6, 90)
         sheets = pd.read_excel(BytesIO(file_bytes), sheet_name=None)
-        self.assertEqual(set(sheets), {"Итоги", "Сравнение", "Требует проверки", "Методика"})
+        self.assertEqual(
+            set(sheets),
+            {"Итоги", "План закупки", "Сравнение", "Требует проверки", "Методика"},
+        )
         self.assertEqual(len(sheets["Сравнение"]), 3)
+
+    def test_selection_modes_and_savings(self):
+        cheapest, _ = compare_offers(self.offers, eur_rate=90, selection_mode="lowest_price")
+        cheapest = cheapest.set_index("Артикул")
+        self.assertEqual(cheapest.loc["BN023221", "Победитель"], "НДВ")
+
+        originals, _ = compare_offers(self.offers, eur_rate=90, selection_mode="original_only")
+        originals = originals.set_index("Артикул")
+        self.assertEqual(originals.loc["BN023221", "Победитель"], "ТД СК НОВОСИБ")
+        self.assertEqual(originals.loc["AL100005", "Победитель"], "Нет цены")
+        self.assertIn("Только оригинал", originals.loc["AL100005", "Причина"])
+
+        balanced, _ = compare_offers(self.offers, eur_rate=90)
+        self.assertEqual(float(balanced["Экономия ₽"].fillna(0).sum()), 8000.0)
+
+    def test_manual_supplier_choice_rebuilds_orders(self):
+        comparison, _ = compare_offers(self.offers, eur_rate=90)
+        number = int(comparison.loc[comparison["Артикул"] == "BN023221", "№"].iloc[0])
+        edited, allocations, warnings = apply_supplier_choices(comparison, {number: "Стройтехникс"})
+        row = edited.set_index("Артикул").loc["BN023221"]
+        self.assertFalse(warnings)
+        self.assertEqual(row["Победитель"], "Стройтехникс")
+        self.assertIn("Ручной выбор", row["Причина"])
+        self.assertEqual(len(allocations["Стройтехникс"]), 3)
+
+    def test_invalid_manual_choice_keeps_automatic_winner(self):
+        comparison, _ = compare_offers(self.offers, eur_rate=90)
+        number = int(comparison.loc[comparison["Артикул"] == "AL100005", "№"].iloc[0])
+        edited, _, warnings = apply_supplier_choices(comparison, {number: "НДВ"})
+        row = edited.set_index("Артикул").loc["AL100005"]
+        self.assertEqual(row["Победитель"], "Стройтехникс")
+        self.assertEqual(len(warnings), 1)
+
+    def test_all_supplier_orders_zip(self):
+        comparison, allocations = compare_offers(self.offers, eur_rate=90)
+        archive = supplier_zip(allocations)
+        with zipfile.ZipFile(BytesIO(archive)) as zipped:
+            names = zipped.namelist()
+            self.assertEqual(len(names), 2)
+            self.assertTrue(all(name.endswith(".xlsx") for name in names))
+            for name in names:
+                self.assertGreater(len(zipped.read(name)), 500)
 
     def test_article_extraction(self):
         self.assertEqual(article_from_name("Блок клапанов 210833 (Bell 30D)"), "210833")
